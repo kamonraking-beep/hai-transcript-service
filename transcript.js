@@ -1,13 +1,10 @@
 /**
  * Transcript Service — Phase 6
  * Uses YouTube's Innertube API (impersonating Android client)
- * This is the server-side solution that actually works.
- *
- * DEPLOY THIS as a simple Express endpoint on any VPS/serverless.
- * Your studio1live.com backend calls this — browser CORS is irrelevant.
+ * + YouTube Data API for metadata and caption track detection
  *
  * POST /transcript  { videoId: "abc123" }
- * Returns: { transcript, segments, source, language, wordCount }
+ * GET  /health
  */
 
 const express = require('express');
@@ -32,7 +29,57 @@ app.use((req, res, next) => {
   next();
 });
 
-// ── Parse SRT/XML/JSON3 caption formats ──
+// ── YouTube Data API helpers ──
+const YT_API_KEY = process.env.YOUTUBE_API_KEY || '';
+
+async function getVideoMetadata(videoId) {
+  if (!YT_API_KEY) return null;
+  try {
+    const url = `https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails&id=${videoId}&key=${YT_API_KEY}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const item = data.items?.[0];
+    if (!item) return null;
+    return {
+      title: item.snippet?.title,
+      channel: item.snippet?.channelTitle,
+      description: item.snippet?.description?.slice(0, 500),
+      duration: item.contentDetails?.duration,
+      language: item.snippet?.defaultAudioLanguage || item.snippet?.defaultLanguage
+    };
+  } catch { return null; }
+}
+
+async function getCaptionTracks(videoId) {
+  if (!YT_API_KEY) return [];
+  try {
+    const url = `https://www.googleapis.com/youtube/v3/captions?part=snippet&videoId=${videoId}&key=${YT_API_KEY}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (data.items || []).map(item => ({
+      id: item.id,
+      language: item.snippet?.language,
+      trackKind: item.snippet?.trackKind,
+      name: item.snippet?.name
+    }));
+  } catch { return []; }
+}
+
+// ── Parse JSON3 caption format ──
+function parseJson3(data) {
+  if (!data || !data.events) return [];
+  return data.events
+    .filter(e => e.segs && e.segs.length)
+    .map(e => ({
+      ts: Math.floor((e.tStartMs || 0) / 1000),
+      text: e.segs.map(s => (s.utf8 || '').replace(/\n/g, ' ')).join('').trim()
+    }))
+    .filter(s => s.text.length > 1);
+}
+
+// ── Parse XML caption format ──
 function parseCaptionXml(xmlText) {
   const segments = [];
   const regex = /<text start="([^"]+)" dur="([^"]+)"[^>]*>([^<]*(?:<[^/][^>]*>[^<]*<\/[^>]+>[^<]*)*)<\/text>/g;
@@ -53,17 +100,6 @@ function parseCaptionXml(xmlText) {
   return segments;
 }
 
-function parseJson3(data) {
-  if (!data || !data.events) return [];
-  return data.events
-    .filter(e => e.segs && e.segs.length)
-    .map(e => ({
-      ts: Math.floor((e.tStartMs || 0) / 1000),
-      text: e.segs.map(s => (s.utf8 || '').replace(/\n/g, ' ')).join('').trim()
-    }))
-    .filter(s => s.text.length > 1);
-}
-
 function segmentsToText(segments) {
   return segments.map(s => {
     const m = Math.floor(s.ts / 60);
@@ -72,8 +108,7 @@ function segmentsToText(segments) {
   }).join('\n');
 }
 
-// ── Strategy 1: YouTube Innertube API (Android client impersonation) ──
-// This is the most reliable method in 2025 — no API key needed
+// ── Strategy 1: Innertube Android client (most reliable) ──
 async function fetchViaInnertube(videoId) {
   const ANDROID_CLIENT = {
     clientName: 'ANDROID',
@@ -85,9 +120,7 @@ async function fetchViaInnertube(videoId) {
   };
 
   const payload = {
-    context: {
-      client: ANDROID_CLIENT
-    },
+    context: { client: ANDROID_CLIENT },
     videoId,
     racyCheckOk: false,
     contentCheckOk: false
@@ -113,7 +146,6 @@ async function fetchViaInnertube(videoId) {
   const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
   if (!tracks.length) return null;
 
-  // Sort: prefer English manual > English auto > any
   const sorted = [...tracks].sort((a, b) => {
     const aEn = (a.languageCode || '').startsWith('en') ? 0 : 1;
     const bEn = (b.languageCode || '').startsWith('en') ? 0 : 1;
@@ -144,7 +176,7 @@ async function fetchViaInnertube(videoId) {
   };
 }
 
-// ── Strategy 2: WEB client Innertube (fallback) ──
+// ── Strategy 2: Innertube WEB client (fallback) ──
 async function fetchViaInnertubeWeb(videoId) {
   const res = await fetch('https://www.youtube.com/youtubei/v1/player', {
     method: 'POST',
@@ -159,7 +191,8 @@ async function fetchViaInnertubeWeb(videoId) {
         client: {
           clientName: 'WEB',
           clientVersion: '2.20240101.00.00',
-          hl: 'en', gl: 'US'
+          hl: 'en',
+          gl: 'US'
         }
       },
       videoId
@@ -181,10 +214,15 @@ async function fetchViaInnertubeWeb(videoId) {
   const captionData = await cr.json();
   const segments = parseJson3(captionData);
 
-  return { segments, language: track.languageCode, source: 'innertube-web', isAutoGenerated: track.kind === 'asr' };
+  return {
+    segments,
+    language: track.languageCode,
+    source: 'innertube-web',
+    isAutoGenerated: track.kind === 'asr'
+  };
 }
 
-// ── Strategy 3: youtube-transcript-api compatible approach ──
+// ── Strategy 3: Direct timedtext API ──
 async function fetchViaTimedText(videoId) {
   for (const lang of ['en', 'a.en', 'en-US', 'en-GB']) {
     try {
@@ -196,7 +234,12 @@ async function fetchViaTimedText(videoId) {
       if (!res.ok) continue;
       const data = await res.json();
       const segs = parseJson3(data);
-      if (segs.length > 3) return { segments: segs, language: lang, source: 'timedtext', isAutoGenerated: lang.startsWith('a.') };
+      if (segs.length > 3) return {
+        segments: segs,
+        language: lang,
+        source: 'timedtext',
+        isAutoGenerated: lang.startsWith('a.')
+      };
     } catch { /* try next */ }
   }
   return null;
@@ -206,7 +249,6 @@ async function fetchViaTimedText(videoId) {
 app.post('/transcript', async (req, res) => {
   const { videoId, url } = req.body;
 
-  // Extract video ID from URL if provided
   let vid = videoId;
   if (!vid && url) {
     const match = url.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
@@ -217,7 +259,21 @@ app.post('/transcript', async (req, res) => {
 
   console.log(`[transcript] Fetching: ${vid}`);
 
-  // Try strategies in order
+  // ── Get metadata and caption tracks via YouTube Data API ──
+  const [metadata, captionTracks] = await Promise.all([
+    getVideoMetadata(vid),
+    getCaptionTracks(vid)
+  ]);
+
+  if (metadata) {
+    console.log(`[transcript] Video: "${metadata.title}" by ${metadata.channel}`);
+  }
+
+  if (captionTracks.length > 0) {
+    console.log(`[transcript] Caption tracks: ${captionTracks.map(t => `${t.language}(${t.trackKind})`).join(', ')}`);
+  }
+
+  // ── Try transcript strategies in order ──
   let result = null;
 
   try { result = await fetchViaInnertube(vid); }
@@ -237,7 +293,11 @@ app.post('/transcript', async (req, res) => {
     return res.json({
       success: false,
       videoId: vid,
-      error: 'No captions available for this video. The video may have no captions, or they may be disabled.',
+      metadata,
+      captionTracksAvailable: captionTracks.length,
+      error: captionTracks.length === 0
+        ? 'This video has no captions available.'
+        : 'Captions exist but could not be fetched — may be member-only or restricted.',
       segments: [],
       transcript: ''
     });
@@ -246,7 +306,7 @@ app.post('/transcript', async (req, res) => {
   const transcript = segmentsToText(result.segments);
   const wordCount = transcript.split(/\s+/).length;
 
-  console.log(`[transcript] Success: ${result.segments.length} segments, ${wordCount} words (${result.source})`);
+  console.log(`[transcript] Success: ${result.segments.length} segments, ~${wordCount} words (${result.source})`);
 
   return res.json({
     success: true,
@@ -257,13 +317,24 @@ app.post('/transcript', async (req, res) => {
     segments: result.segments,
     transcript,
     wordCount,
-    segmentCount: result.segments.length
+    segmentCount: result.segments.length,
+    metadata,
+    captionTracks
   });
 });
 
 // ── Health check ──
-app.get('/health', (req, res) => res.json({ status: 'ok', version: '6.0.0' }));
+app.get('/health', (req, res) => res.json({
+  status: 'ok',
+  version: '6.1.0',
+  youtubeApiKey: YT_API_KEY ? 'configured' : 'not set'
+}));
 
-const PORT = process.env.PORT || 4000;
+// ── Keep-alive for Railway free tier ──
+setInterval(() => {
+  console.log('[keepalive] still running at', new Date().toISOString());
+}, 60000);
+
+const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`Transcript service running on port ${PORT}`));
 module.exports = app;
