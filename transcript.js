@@ -329,7 +329,12 @@ app.get('/health', (req, res) => res.json({
   version: '6.1.0',
   youtubeApiKey: YT_API_KEY ? 'configured' : 'not set'
 }));
-
+app.post('/api/transcript', async (req, res) => {
+  // same handler — just forward to the existing one
+  return req.app._router.handle(
+    Object.assign(req, { url: '/transcript' }), res, () => {}
+  );
+});
 // ── Keep-alive for Railway free tier ──
 setInterval(() => {
   console.log('[keepalive] still running at', new Date().toISOString());
